@@ -574,62 +574,84 @@ def _best_worst(trades: list[dict]) -> tuple[str, str]:
 
 def handle_backtest(chat_id: int, args: list[str]):
     """
-    /backtest SYMBOL [START END]
-    Runs the actual backtest engine for the requested symbol and date range.
+    Supported forms:
+    /backtest
+    /backtest ALL
+    /backtest BTCUSDT
+    /backtest 2025-01-01 2025-12-31
+    /backtest ALL 2025-01-01 2025-12-31
+    /backtest BTCUSDT 2025-01-01 2025-12-31
     """
     try:
-        if len(args) not in (0, 1, 3):
+        if len(args) not in (0, 1, 2, 3):
             tg_reply(
                 chat_id,
-                "⚠️ Использование: <code>/backtest BTCUSDT</code> или "
+                "⚠️ Использование:\n"
+                "<code>/backtest</code>\n"
+                "<code>/backtest ALL</code>\n"
+                "<code>/backtest BTCUSDT</code>\n"
+                "<code>/backtest 2025-01-01 2025-12-31</code>\n"
+                "<code>/backtest ALL 2025-01-01 2025-12-31</code>\n"
                 "<code>/backtest BTCUSDT 2025-01-01 2025-12-31</code>"
             )
             return
-        symbol = args[0].upper() if args else "BTCUSDT"
-        if len(args) == 3:
-            start, end = args[1], args[2]
-        else:
+
+        mode = "portfolio"
+        symbol = "ALL"
+        if len(args) == 1 and args[0].upper() != "ALL":
+            mode = "symbol"
+            symbol = args[0].upper()
+        elif len(args) == 2:
+            start, end = args[0], args[1]
+        elif len(args) == 3:
+            if args[0].upper() == "ALL":
+                start, end = args[1], args[2]
+            else:
+                mode = "symbol"
+                symbol = args[0].upper()
+                start, end = args[1], args[2]
+
+        if "start" not in locals():
             end = datetime.utcnow().strftime("%Y-%m-%d")
             start = (pd.Timestamp.utcnow() - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
 
         tg_reply(
             chat_id,
             f"⏳ <b>Считаю бэктест...</b>\n"
-            f"Символ: <code>{symbol}</code>\n"
+            f"Режим: <code>{'ВСЕ СДЕЛКИ' if mode == 'portfolio' else symbol}</code>\n"
             f"Период: <code>{start}</code> → <code>{end}</code>"
         )
 
-        from backtest import run_backtest, compute_metrics
+        from backtest import (
+            run_backtest,
+            run_portfolio_backtest,
+            compute_metrics,
+            format_backtest_report,
+        )
 
-        trades = run_backtest(symbol=symbol, start=start, end=end)
+        subtitle = symbol
+        if mode == "portfolio":
+            trades, active_symbols = run_portfolio_backtest(
+                start=start,
+                end=end,
+                max_symbols=MAX_SYMBOLS if MAX_SYMBOLS > 0 else 0,
+            )
+            subtitle = f"ALL PAIRS ({len(active_symbols)} symbols)"
+        else:
+            trades = run_backtest(symbol=symbol, start=start, end=end)
+
         if not trades:
-            tg_reply(chat_id, f"⚠️ Для <code>{symbol}</code> нет сделок на периоде {start} → {end}.")
+            tg_reply(
+                chat_id,
+                f"⚠️ Нет сделок для режима <code>{subtitle}</code> на периоде {start} → {end}."
+            )
             return
 
         metrics = compute_metrics(trades)
-        verdict = "🟢 Сетап выглядит сильным" if metrics["profit_factor"] >= 1.4 and metrics["winrate_pct"] >= 45 else "🟡 Нужна дополнительная проверка"
-        if metrics["profit_factor"] < 1.0 or metrics["total_return_pct"] <= 0:
-            verdict = "🔴 В таком виде торговать рискованно"
-
-        msg = (
-            f"📊 <b>BACKTEST</b>\n"
-            f"🪙 <code>{symbol}</code>\n"
-            f"🗓 {start} → {end}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Сделок: <b>{metrics['total_trades']}</b>\n"
-            f"Win rate: <b>{metrics['winrate_pct']:.1f}%</b>\n"
-            f"Profit factor: <b>{metrics['profit_factor']:.2f}</b>\n"
-            f"Total return: <b>{metrics['total_return_pct']:+.2f}%</b>\n"
-            f"Max DD: <b>{metrics['max_drawdown_pct']:.2f}%</b>\n"
-            f"Avg R: <b>{metrics['avg_rr']:.2f}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"TP2: <b>{metrics['tp2_count']}</b>\n"
-            f"TP1->BE: <b>{metrics['tp1_be_count']}</b>\n"
-            f"TP1->TIME: <b>{metrics['tp1_time_count']}</b>\n"
-            f"SL: <b>{metrics['sl_count']}</b>\n"
-            f"TIME: <b>{metrics['time_count']}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"{verdict}"
+        msg = format_backtest_report(
+            metrics,
+            title="БЭКТЕСТ РЕЗУЛЬТАТЫ",
+            subtitle=f"{subtitle} | {start} → {end}",
         )
 
         tg_reply(chat_id, msg)
@@ -676,7 +698,12 @@ def handle_help(chat_id: int):
     tg_reply(chat_id,
         "🤖 <b>Pump Reversal Bot — Команды</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "/backtest <code>SYMBOL</code> — бэктест за последние 180 дней\n"
+        "/backtest — общий бэктест по всем сделкам за 180 дней\n"
+        "  Пример: <code>/backtest</code>\n"
+        "  С датами: <code>/backtest 2025-01-01 2025-12-31</code>\n\n"
+        "/backtest <code>ALL</code> — то же самое явно\n"
+        "  Пример: <code>/backtest ALL</code>\n\n"
+        "/backtest <code>SYMBOL</code> — бэктест одной монеты за 180 дней\n"
         "  Пример: <code>/backtest PEPEUSDT</code>\n"
         "  С датами: <code>/backtest BTCUSDT 2025-01-01 2025-12-31</code>\n\n"
         "/status — настройки и статистика бота\n\n"
@@ -771,7 +798,8 @@ def main():
         f"Min core score: {Config.MIN_SCORE}/5\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Команды:\n"
-        f"/backtest PEPEUSDT — бэктест\n"
+        f"/backtest — общий бэктест\n"
+        f"/backtest PEPEUSDT — бэктест монеты\n"
         f"/status — статус бота\n"
         f"/help — справка\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
