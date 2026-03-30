@@ -88,6 +88,12 @@ python backtest.py --symbol BTCUSDT --start 2025-01-01 --end 2025-12-31
 
 # Run on altcoin
 python backtest.py --symbol SOLUSDT --start 2025-06-01 --end 2025-12-31
+
+# Run portfolio backtest across all current liquid pairs
+python backtest.py --all --start 2025-01-01 --end 2025-12-31
+
+# Limit the portfolio universe to top 50 liquid pairs
+python backtest.py --all --max-symbols 50 --start 2025-01-01 --end 2025-12-31
 ```
 
 Backtest assumptions:
@@ -100,6 +106,7 @@ Backtest assumptions:
 Output:
 - Metrics printed to console
 - `backtest_BTCUSDT.csv` — all trades
+- `backtest_ALL.csv` — all trades for portfolio mode
 - `backtest_equity.png` — equity curve chart
 
 ## Signal Format (Telegram)
