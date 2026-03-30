@@ -1,17 +1,11 @@
-
----
-
-## 3. `data.py` – полная версия (с историческими OI/funding и кэшем)
-
-```python
 """
 data.py — Binance API layer with caching and historical data.
 """
 
 import time
 import logging
-import pandas as pd
 import requests
+import pandas as pd
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from typing import Optional, Dict, Any
@@ -21,7 +15,7 @@ BASE_URL = "https://fapi.binance.com"
 
 # ---------- HTTP Session ----------
 _session = None
-_cache = {}  # {key: {'data': ..., 'ts': ...}}
+_cache = {}
 
 def _make_session():
     session = requests.Session()
@@ -45,7 +39,6 @@ def _get(url: str, params: dict = None, timeout: int = 10, ttl: int = 60) -> Opt
 
     try:
         resp = _session.get(url, params=params, timeout=timeout)
-        # Rate limit backoff
         used_weight = int(resp.headers.get("X-MBX-USED-WEIGHT-1M", 0))
         if used_weight > 1000:
             wait = 2.0 + (used_weight - 1000) / 100
@@ -67,7 +60,6 @@ def _get(url: str, params: dict = None, timeout: int = 10, ttl: int = 60) -> Opt
         logger.warning(f"_get error: {e}")
         return None
 
-# ---------- Ticker (one call) ----------
 def get_all_24h_changes() -> Dict[str, float]:
     """Returns dict {symbol: priceChangePercent} for all USDT perps."""
     data = _get(f"{BASE_URL}/fapi/v1/ticker/24hr", ttl=30)
@@ -86,7 +78,6 @@ def get_all_24h_changes() -> Dict[str, float]:
     return result
 
 def get_futures_symbols(min_volume_usdt: float = 5_000_000) -> list[str]:
-    """Return liquid USDT perps (volume filter)."""
     data = _get(f"{BASE_URL}/fapi/v1/ticker/24hr", ttl=30)
     if not data:
         return []
@@ -105,14 +96,13 @@ def get_futures_symbols(min_volume_usdt: float = 5_000_000) -> list[str]:
         symbols.append(sym)
     return symbols
 
-# ---------- KLINES ----------
 _KLINE_COLS = ["open_time", "open", "high", "low", "close", "volume", "close_time",
                "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore"]
 
 def get_klines(symbol: str, interval: str, limit: int = 100) -> Optional[pd.DataFrame]:
     data = _get(f"{BASE_URL}/fapi/v1/klines",
                 {"symbol": symbol, "interval": interval, "limit": limit},
-                ttl=15)  # 15s cache
+                ttl=15)
     if not data or len(data) < 5:
         return None
     try:
@@ -129,7 +119,6 @@ def get_klines(symbol: str, interval: str, limit: int = 100) -> Optional[pd.Data
         return None
 
 def get_historical_klines(symbol: str, interval: str, start_str: str, end_str: str) -> Optional[pd.DataFrame]:
-    """Paginated historical klines."""
     start_ts = int(pd.Timestamp(start_str).timestamp() * 1000)
     end_ts = int(pd.Timestamp(end_str).timestamp() * 1000) if end_str else int(time.time() * 1000)
     all_rows = []
@@ -138,7 +127,7 @@ def get_historical_klines(symbol: str, interval: str, start_str: str, end_str: s
         data = _get(f"{BASE_URL}/fapi/v1/klines", {
             "symbol": symbol, "interval": interval,
             "startTime": current, "endTime": end_ts, "limit": 1500
-        }, ttl=0)  # no cache for historical
+        }, ttl=0)
         if not data:
             break
         all_rows.extend(data)
@@ -154,9 +143,7 @@ def get_historical_klines(symbol: str, interval: str, start_str: str, end_str: s
     df = df[["open", "high", "low", "close", "volume"]].dropna()
     return df
 
-# ---------- FUNDING (historical) ----------
 def get_funding_rate(symbol: str) -> Optional[float]:
-    """Current funding rate."""
     data = _get(f"{BASE_URL}/fapi/v1/premiumIndex", {"symbol": symbol}, ttl=30)
     if not data:
         return None
@@ -167,7 +154,6 @@ def get_funding_rate(symbol: str) -> Optional[float]:
         return None
 
 def get_historical_funding(symbol: str, start_ts: int, end_ts: int) -> pd.DataFrame:
-    """Funding rate history between timestamps (ms)."""
     data = _get(f"{BASE_URL}/fapi/v1/fundingInfo", {"symbol": symbol, "limit": 1000}, ttl=0)
     if not data:
         return pd.DataFrame()
@@ -178,9 +164,7 @@ def get_historical_funding(symbol: str, start_ts: int, end_ts: int) -> pd.DataFr
             (df["fundingTime"] <= pd.Timestamp(end_ts, unit="ms", utc=True))]
     return df.set_index("fundingTime")
 
-# ---------- OPEN INTEREST (historical) ----------
 def get_open_interest_history(symbol: str, period: str = "1h", limit: int = 6) -> Optional[pd.DataFrame]:
-    """Recent OI history (max 1000)."""
     data = _get(f"{BASE_URL}/futures/data/openInterestHist",
                 {"symbol": symbol, "period": period, "limit": limit},
                 ttl=30)
@@ -192,7 +176,6 @@ def get_open_interest_history(symbol: str, period: str = "1h", limit: int = 6) -
     return df.set_index("timestamp")
 
 def get_historical_oi(symbol: str, start_ts: int, end_ts: int, period: str = "1h") -> pd.DataFrame:
-    """Paginated OI history."""
     all_rows = []
     current = start_ts
     while current < end_ts:
@@ -212,7 +195,6 @@ def get_historical_oi(symbol: str, start_ts: int, end_ts: int, period: str = "1h
     df["sumOpenInterestValue"] = pd.to_numeric(df["sumOpenInterestValue"])
     return df.set_index("timestamp")
 
-# ---------- OI divergence (current) ----------
 def is_oi_diverging(symbol: str) -> bool:
     oi_df = get_open_interest_history(symbol, period="1h", limit=6)
     klines = get_klines(symbol, "1h", limit=6)
