@@ -16,7 +16,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -28,9 +28,16 @@ import numpy as np
 import pandas as pd
 import requests
 
-from data import get_futures_market_snapshot
+from data import get_24h_tickers, get_latest_prices
 from strategy import analyze_symbol, Signal, Config
 from indicators import calc_rsi
+from paper_trading import (
+    open_paper_trade,
+    update_open_trades,
+    get_paper_report,
+    reset_paper_account,
+    get_open_trade_symbols,
+)
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -56,7 +63,6 @@ SCAN_INTERVAL   = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))
 SIGNALS_CSV     = Path("signals.csv")
 SIGNAL_COOLDOWN  = 7200
 COOLDOWN_FILE    = Path("cooldown.json")
-MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS", "0"))
 _signal_cache: dict[str, float] = {}
 
 
@@ -217,25 +223,44 @@ def generate_chart(signal: Signal) -> Optional[bytes]:
             ax_price.add_patch(rect)
 
         # ── Horizontal trade levels ─────────────────
-        levels = [
-            (signal.stop_loss, RED,       "--", f"SL  {_price_fmt(signal.stop_loss)}"),
-            (signal.entry,     WHITE,     "--", f"Entry  {_price_fmt(signal.entry)}"),
-            (signal.tp1,       GREEN,     ":",  f"TP1  {_price_fmt(signal.tp1)}"),
-            (signal.tp2,       "#00c853", ":",  f"TP2  {_price_fmt(signal.tp2)}"),
-            (signal.entry,     "#ffd600", ":",  f"BE (после TP1)"),
+        trade_levels = [
+            (signal.stop_loss, RED,       "--", 2.0, f"SL  {_price_fmt(signal.stop_loss)}"),
+            (signal.entry,     WHITE,     "--", 1.8, f"Entry  {_price_fmt(signal.entry)}"),
+            (signal.entry,     "#ffd600", ":",  1.2, f"BE  {_price_fmt(signal.entry)}"),
+            (signal.tp1,       GREEN,     ":",  1.5, f"TP1  {_price_fmt(signal.tp1)}"),
+            (signal.tp2,       "#00c853", ":",  2.0, f"TP2  {_price_fmt(signal.tp2)}"),
         ]
-        if signal.resistance_4h:
-            levels.append((signal.resistance_4h, ORANGE, "-.", f"Res4H  {_price_fmt(signal.resistance_4h)}"))
-        if signal.resistance_1d:
-            levels.append((signal.resistance_1d, "#ff5722", "-.", f"Res1D  {_price_fmt(signal.resistance_1d)}"))
 
-        for price_level, color, ls, label in levels:
-            ax_price.axhline(price_level, color=color, linewidth=1.3,
-                             linestyle=ls, alpha=0.9, zorder=4)
+        for price_level, color, ls, lw, label in trade_levels:
+            ax_price.axhline(price_level, color=color, linewidth=lw,
+                             linestyle=ls, alpha=0.95, zorder=4)
             ax_price.text(
                 n + 0.3, price_level, label,
-                color=color, fontsize=7.5, va="center",
-                fontweight="bold"
+                color=color, fontsize=7.5, va="center", fontweight="bold"
+            )
+
+        # ── Resistance zones (жирные, с зоной ±0.5%) ──
+        res_levels = []
+        if signal.resistance_4h:
+            res_levels.append((signal.resistance_4h, "#ff9800", "4H"))
+        if signal.resistance_1d:
+            res_levels.append((signal.resistance_1d, "#ff5722", "1D"))
+
+        for res_price, res_color, res_tf in res_levels:
+            # Зона ±0.5%
+            zone_h = res_price * 0.005
+            ax_price.axhspan(
+                res_price - zone_h, res_price + zone_h,
+                alpha=0.18, color=res_color, zorder=2
+            )
+            # Центральная линия
+            ax_price.axhline(res_price, color=res_color, linewidth=2.0,
+                             linestyle="-", alpha=0.9, zorder=5)
+            # Подпись с таймфреймом
+            ax_price.text(
+                n + 0.3, res_price,
+                f"Res {res_tf}  {_price_fmt(res_price)}",
+                color=res_color, fontsize=8, va="center", fontweight="bold"
             )
 
         # ── Zone shading ────────────────────────────
@@ -244,18 +269,25 @@ def generate_chart(signal: Signal) -> Optional[bytes]:
 
         # ── Price axis limits ───────────────────────
         all_prices = list(df["high"]) + list(df["low"]) + [signal.stop_loss, signal.tp2]
-        price_min  = min(all_prices) * 0.995
-        price_max  = max(all_prices) * 1.005
+        if signal.resistance_4h: all_prices.append(signal.resistance_4h)
+        if signal.resistance_1d: all_prices.append(signal.resistance_1d)
+        price_min  = min(all_prices) * 0.994
+        price_max  = max(all_prices) * 1.006
         ax_price.set_ylim(price_min, price_max)
-        ax_price.set_xlim(-1, n + 8)  # right margin for labels
-        ax_price.set_ylabel("Price", color="#888", fontsize=9)
-        ax_price.yaxis.set_label_position("left")
-        ax_price.yaxis.tick_left()
+        ax_price.set_xlim(-1, n + 10)
+        ax_price.set_ylabel("Price (USDT)", color="#888", fontsize=9)
 
-        # ── Title ───────────────────────────────────
+        # ── Title + таймфрейм ───────────────────────
         ax_price.set_title(
-            f"SHORT SIGNAL  ·  {signal.symbol}  ·  Score {signal.score}/7  ·  Pump +{signal.pump_percent:.1f}%",
+            f"SHORT SIGNAL  ·  {signal.symbol}  ·  4H Chart  ·  Score {signal.score}/7  ·  Pump +{signal.pump_percent:.1f}%",
             color=WHITE, fontsize=12, fontweight="bold", pad=10
+        )
+
+        # Таймфрейм в углу
+        ax_price.text(
+            0.01, 0.97, "4H", transform=ax_price.transAxes,
+            color="#888", fontsize=10, va="top", fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#1a1a1a", alpha=0.7)
         )
 
         # ── Volume bars ─────────────────────────────
@@ -318,8 +350,6 @@ def generate_chart(signal: Signal) -> Optional[bytes]:
 def format_signal_message(signal: Signal) -> str:
     res_4h = _price_fmt(signal.resistance_4h) if signal.resistance_4h else "—"
     res_1d = _price_fmt(signal.resistance_1d) if signal.resistance_1d else "—"
-    funding = f"{signal.funding_rate * 100:.4f}%" if signal.funding_rate is not None else "n/a"
-    open_interest = f"${signal.open_interest:,.0f}" if signal.open_interest is not None else "n/a"
 
     return (
         f"⚡ <b>PUMP REVERSAL SIGNAL</b>\n"
@@ -333,8 +363,8 @@ def format_signal_message(signal: Signal) -> str:
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📈 <b>Pump 24H:</b> +{signal.pump_percent:.1f}%\n"
         f"📊 <b>RSI (4H):</b> {signal.rsi:.1f}\n"
-        f"💰 <b>Funding:</b> {funding}\n"
-        f"📦 <b>Open Interest:</b> {open_interest}\n"
+        f"💰 <b>Funding:</b> {signal.funding_rate * 100:.4f}%\n"
+        f"📦 <b>Open Interest:</b> ${signal.open_interest:,.0f}\n"
         f"🔀 <b>Volume:</b> {signal.volume_ratio:.1f}x avg\n"
         f"{'🔻' if signal.oi_divergence else '➖'} <b>OI Divergence:</b> {'YES' if signal.oi_divergence else 'NO'}\n"
         f"{'🔫' if signal.liquidity_sweep else '➖'} <b>Liq Sweep:</b> {'YES' if signal.liquidity_sweep else 'NO'}\n"
@@ -342,7 +372,7 @@ def format_signal_message(signal: Signal) -> str:
         f"🏔 <b>Res 4H:</b> <code>{res_4h}</code>\n"
         f"🏔 <b>Res 1D:</b> <code>{res_1d}</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⭐ <b>Score:</b> {signal.score}/7 (core {signal.core_score}/5, bonus {signal.bonus_score}/2)\n"
+        f"⭐ <b>Score:</b> {signal.score}/7\n"
         f"⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
     )
 
@@ -365,15 +395,15 @@ def log_signal_to_csv(signal: Signal):
             if not file_exists:
                 w.writeheader()
             w.writerow({
-                "date":          datetime.utcnow().isoformat(),
+                "date":          datetime.now(timezone.utc).isoformat(),
                 "symbol":        signal.symbol,
                 "entry":         round(signal.entry, 8),
                 "stop_loss":     round(signal.stop_loss, 8),
                 "tp1":           round(signal.tp1, 8),
                 "tp2":           round(signal.tp2, 8),
                 "rsi":           round(signal.rsi, 2),
-                "funding":       round(signal.funding_rate, 6) if signal.funding_rate is not None else "",
-                "open_interest": round(signal.open_interest, 2) if signal.open_interest is not None else "",
+                "funding":       round(signal.funding_rate, 6),
+                "open_interest": round(signal.open_interest, 2),
                 "pump_percent":  round(signal.pump_percent, 2),
                 "score":         signal.score,
             })
@@ -402,21 +432,27 @@ def scan_market():
     logger.info("━━━ Starting scan ━━━")
     t0 = time.time()
 
-    market = get_futures_market_snapshot(min_volume_usdt=5_000_000)
-    if MAX_SYMBOLS > 0:
-        market = market[:MAX_SYMBOLS]
-    logger.info(f"Scanning {len(market)} symbols")
+    tickers = get_24h_tickers(min_volume_usdt=5_000_000)
+    if not tickers:
+        logger.warning("No tickers received from Binance")
+        return
 
-    pumped = [
-        (item["symbol"], item["price_change_percent"], item["quote_volume"])
-        for item in market
-        if item["price_change_percent"] >= Config.MIN_PUMP_PCT
-    ]
-    pumped.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    tickers.sort(key=lambda x: x.get("quoteVolume", 0), reverse=True)
+    tickers = tickers[:250]
+    logger.info(f"Scanning {len(tickers)} symbols")
+
+    # Fast pre-filter: collect pumped coins
+    pumped = []
+    for t in tickers:
+        pct = t.get("priceChangePercent")
+        if pct is not None and pct >= Config.MIN_PUMP_PCT:
+            pumped.append((t["symbol"], pct))
+
+    pumped.sort(key=lambda x: x[1], reverse=True)
     logger.info(f"Pumped ≥{Config.MIN_PUMP_PCT}%: {len(pumped)}")
 
     sent = 0
-    for symbol, pump_pct, quote_volume in pumped:
+    for symbol, pump_pct in pumped:
         if is_on_cooldown(symbol):
             continue
         try:
@@ -424,7 +460,7 @@ def scan_market():
             if signal is None:
                 continue
 
-            logger.info(f"🚨 {symbol} score={signal.score}/7 vol=${quote_volume:,.0f}")
+            logger.info(f"🚨 {symbol} score={signal.score}/7")
 
             chart = generate_chart(signal)
             msg   = format_signal_message(signal)
@@ -436,6 +472,12 @@ def scan_market():
 
             log_signal_to_csv(signal)
             mark_signalled(symbol)
+
+            # Открываем paper trade по этому сигналу
+            paper_trade = open_paper_trade(signal)
+            if paper_trade:
+                logger.info(f"Paper trade opened: {symbol} x{paper_trade['leverage']}")
+
             sent += 1
             time.sleep(1)
 
@@ -445,6 +487,16 @@ def scan_market():
             time.sleep(0.15)
 
     logger.info(f"━━━ Done: {sent} signals in {time.time()-t0:.1f}s ━━━")
+
+    # Обновляем открытые paper позиции текущими ценами
+    try:
+        open_syms = get_open_trade_symbols()
+        if open_syms:
+            current_prices = get_latest_prices(open_syms)
+            if current_prices:
+                update_open_trades(current_prices)
+    except Exception as e:
+        logger.warning(f"Paper update error: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -501,22 +553,28 @@ def tg_reply_photo(chat_id: int, image_bytes: bytes, caption: str = ""):
 # COMMAND HANDLERS
 # ─────────────────────────────────────────────
 
-def _simulate_outcome(row: dict) -> str:
+def _simulate_outcome(row: dict) -> tuple[str, bool]:
     """
     Fetch candles STARTING from signal date (historical).
-    Checks which level was hit first: SL, TP2, TP1.
-    Returns: 'TP2', 'TP1', 'SL', or 'OPEN'
+    Checks which level was hit first: SL, TP2, TP1, or BE.
+    After TP1 is hit — SL moves to entry (breakeven).
+    Returns: (result, tp1_hit)
+    result: 'TP2', 'SL', 'BE', or 'OPEN'
     """
     try:
         symbol   = row["symbol"]
+        entry    = float(row["entry"])
         sl       = float(row["stop_loss"])
         tp1      = float(row["tp1"])
         tp2      = float(row["tp2"])
         sig_time = pd.Timestamp(row["date"])
+        if sig_time.tzinfo is None:
+            sig_time = sig_time.tz_localize("UTC")
+        else:
+            sig_time = sig_time.tz_convert("UTC")
 
-        # Pull historical 4H candles from signal date + 6 days forward
         start_str = sig_time.strftime("%Y-%m-%d %H:%M:%S")
-        end_str   = (sig_time + pd.Timedelta(days=6)).strftime("%Y-%m-%d %H:%M:%S")
+        end_str   = (sig_time + pd.Timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S")
 
         from data import get_historical_klines
         df = get_historical_klines(symbol, "4h", start_str=start_str, end_str=end_str)
@@ -524,24 +582,40 @@ def _simulate_outcome(row: dict) -> str:
         if df is None or df.empty:
             return "OPEN"
 
-        # Skip first candle (that's the signal candle itself)
-        future = df.iloc[1:31]
+        future = df.iloc[1:61]
         if future.empty:
             return "OPEN"
 
-        for _, candle in future.iterrows():
-            if candle["high"] >= sl:
-                return "SL"
-            if candle["low"] <= tp2:
-                return "TP2"
-            if candle["low"] <= tp1:
-                return "TP1"
+        be_hit     = False
+        tp1_hit    = False
+        current_sl = sl  # SL moves to entry after TP1
 
-        return "OPEN"
+        for _, candle in future.iterrows():
+            high = candle["high"]
+            low  = candle["low"]
+
+            hit_sl  = high >= current_sl
+            hit_tp2 = low <= tp2
+            hit_tp1 = low <= tp1
+
+            # Conservative priority: SL/BE first, then TP2
+            if hit_sl:
+                return ("BE" if be_hit else "SL", tp1_hit or be_hit or hit_tp1)
+
+            if hit_tp2:
+                return ("TP2", True)
+
+            # TP1 hit — move SL to breakeven (no exit)
+            if hit_tp1 and not be_hit:
+                be_hit     = True
+                tp1_hit    = True
+                current_sl = entry  # breakeven
+
+        return ("OPEN", tp1_hit)
 
     except Exception as e:
         logger.warning(f"_simulate_outcome: {e}")
-        return "OPEN"
+        return ("OPEN", False)
 
 
 def _winrate_bar(winrate: float, width: int = 16) -> str:
@@ -554,7 +628,7 @@ def _winrate_bar(winrate: float, width: int = 16) -> str:
 
 def _best_worst(trades: list[dict]) -> tuple[str, str]:
     """Returns (best_trade_str, worst_trade_str) with pnl %."""
-    winners = [t for t in trades if t["result"] in ("TP1", "TP2")]
+    winners = [t for t in trades if t["result"] == "TP2"]
     losers  = [t for t in trades if t["result"] == "SL"]
 
     best  = "—"
@@ -574,84 +648,125 @@ def _best_worst(trades: list[dict]) -> tuple[str, str]:
 
 def handle_backtest(chat_id: int, args: list[str]):
     """
-    Supported forms:
-    /backtest
-    /backtest ALL
-    /backtest BTCUSDT
-    /backtest 2025-01-01 2025-12-31
-    /backtest ALL 2025-01-01 2025-12-31
-    /backtest BTCUSDT 2025-01-01 2025-12-31
+    /backtest — анализирует все сигналы из signals.csv
+    Симулирует исходы (TP1/TP2/SL) и выдаёт итоговый отчёт.
     """
+    tg_reply(chat_id, "⏳ <b>Считаю результаты...</b>\nАнализирую все сигналы из истории, подожди немного.")
+
     try:
-        if len(args) not in (0, 1, 2, 3):
-            tg_reply(
-                chat_id,
-                "⚠️ Использование:\n"
-                "<code>/backtest</code>\n"
-                "<code>/backtest ALL</code>\n"
-                "<code>/backtest BTCUSDT</code>\n"
-                "<code>/backtest 2025-01-01 2025-12-31</code>\n"
-                "<code>/backtest ALL 2025-01-01 2025-12-31</code>\n"
-                "<code>/backtest BTCUSDT 2025-01-01 2025-12-31</code>"
-            )
+        # ── Читаем signals.csv ─────────────────────
+        if not SIGNALS_CSV.exists():
+            tg_reply(chat_id, "⚠️ Файл signals.csv пустой — бот ещё не отправил ни одного сигнала.")
             return
 
-        mode = "portfolio"
-        symbol = "ALL"
-        if len(args) == 1 and args[0].upper() != "ALL":
-            mode = "symbol"
-            symbol = args[0].upper()
-        elif len(args) == 2:
-            start, end = args[0], args[1]
-        elif len(args) == 3:
-            if args[0].upper() == "ALL":
-                start, end = args[1], args[2]
-            else:
-                mode = "symbol"
-                symbol = args[0].upper()
-                start, end = args[1], args[2]
+        rows = []
+        with open(SIGNALS_CSV, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append(row)
 
-        if "start" not in locals():
-            end = datetime.utcnow().strftime("%Y-%m-%d")
-            start = (pd.Timestamp.utcnow() - pd.Timedelta(days=180)).strftime("%Y-%m-%d")
+        if not rows:
+            tg_reply(chat_id, "⚠️ Сигналов в истории нет.")
+            return
 
-        tg_reply(
-            chat_id,
-            f"⏳ <b>Считаю бэктест...</b>\n"
-            f"Режим: <code>{'ВСЕ СДЕЛКИ' if mode == 'portfolio' else symbol}</code>\n"
-            f"Период: <code>{start}</code> → <code>{end}</code>"
-        )
+        total = len(rows)
 
-        from backtest import (
-            run_backtest,
-            run_portfolio_backtest,
-            compute_metrics,
-            format_backtest_report,
-        )
+        # ── Симулируем исходы ──────────────────────
+        results = []
+        for row in rows:
+            outcome, tp1_hit = _simulate_outcome(row)
+            results.append({**row, "result": outcome, "tp1_hit": tp1_hit})
+            time.sleep(0.1)  # не спамим API
 
-        subtitle = symbol
-        if mode == "portfolio":
-            trades, active_symbols = run_portfolio_backtest(
-                start=start,
-                end=end,
-                max_symbols=MAX_SYMBOLS if MAX_SYMBOLS > 0 else 0,
-            )
-            subtitle = f"ALL PAIRS ({len(active_symbols)} symbols)"
+        # ── Считаем статистику ─────────────────────
+        tp2_cnt  = sum(1 for r in results if r["result"] == "TP2")
+        tp1_cnt  = sum(1 for r in results if r.get("tp1_hit"))
+        sl_cnt   = sum(1 for r in results if r["result"] == "SL")
+        be_cnt   = sum(1 for r in results if r["result"] == "BE")
+        open_cnt = sum(1 for r in results if r["result"] == "OPEN")
+
+        wins   = tp2_cnt
+        closed = wins + sl_cnt + be_cnt
+
+        winrate = (wins / closed * 100) if closed > 0 else 0.0
+        bar     = _winrate_bar(winrate)
+
+        # P&L с учётом комиссии 0.08% на сделку
+        COMMISSION = 0.08
+        pnl_list = []
+        for r in results:
+            try:
+                entry = float(r["entry"])
+                sl    = float(r["stop_loss"])
+                tp1   = float(r["tp1"])
+                tp2   = float(r["tp2"])
+                risk  = abs(sl - entry)
+                if r["result"] == "TP2":
+                    pnl = (entry - tp2) / entry * 100 - COMMISSION
+                elif r["result"] == "TP1":
+                    pnl = (entry - tp1) / entry * 100 - COMMISSION
+                elif r["result"] == "SL":
+                    pnl = -risk / entry * 100 - COMMISSION
+                elif r["result"] == "BE":
+                    pnl = -COMMISSION  # вышли в ноль, только комиссия
+                else:
+                    pnl = 0.0
+                r["pnl"] = pnl
+                pnl_list.append(pnl)
+            except Exception:
+                r["pnl"] = 0.0
+
+        total_pnl = sum(pnl_list) if pnl_list else 0.0
+        avg_win   = sum(p for p in pnl_list if p > 0) / max(1, wins)
+        avg_loss  = sum(p for p in pnl_list if p < 0) / max(1, sl_cnt)
+        gross_win = sum(p for p in pnl_list if p > 0)
+        gross_los = abs(sum(p for p in pnl_list if p < 0))
+        pf        = gross_win / gross_los if gross_los > 0 else float("inf")
+        rr        = abs(avg_win / avg_loss) if avg_loss != 0 else 0.0
+
+        best, worst = _best_worst(results)
+
+        now_str = datetime.utcnow().strftime("%d.%m.%Y %H:%M UTC")
+
+        # ── Вердикт ────────────────────────────────
+        if winrate >= 55 and pf >= 1.5:
+            verdict = "🟢 Стратегия прибыльная"
+        elif winrate >= 45 and pf >= 1.0:
+            verdict = "🟡 Стратегия в плюсе"
         else:
-            trades = run_backtest(symbol=symbol, start=start, end=end)
+            verdict = "🔴 Нужна донастройка"
 
-        if not trades:
-            tg_reply(
-                chat_id,
-                f"⚠️ Нет сделок для режима <code>{subtitle}</code> на периоде {start} → {end}."
-            )
-            return
-
-        metrics = compute_metrics(trades)
-        msg = format_backtest_report(
-            metrics,
-            title="БЭКТЕСТ РЕЗУЛЬТАТЫ",
-            subtitle=f"{subtitle} | {start} → {end}",
+        # ── Форматируем отчёт ──────────────────────
+        msg = (
+            f"📊 <b>БЭКТЕСТ РЕЗУЛЬТАТЫ</b>\n"
+            f"🕐 {now_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"\n"
+            f"🏆 <b>WIN RATE</b>\n"
+            f"<code>{bar}</code>  <b>{winrate:.1f}%</b>\n"
+            f"\n"
+            f"🏅 TP2 закрыто:  <b>{tp2_cnt}</b>\n"
+            f"✅ TP1 достигнуто: <b>{tp1_cnt}</b>\n"
+            f"❌ SL сработало: <b>{sl_cnt}</b>\n"
+            f"🔄 Безубыток:    <b>{be_cnt}</b>\n"
+            f"⏱ Тайм-аут:     <b>{open_cnt}</b>\n"
+            f"📊 Всего:        <b>{total}</b>\n"
+            f"\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 <b>P&amp;L</b>\n"
+            f"📉 Итого P&amp;L:      <b>{total_pnl:+.2f}%</b>\n"
+            f"📈 Средний выигрыш: <b>+{avg_win:.2f}%</b>\n"
+            f"📉 Средний стоп:    <b>{avg_loss:.2f}%</b>\n"
+            f"⚖️ Risk/Reward:     <b>{rr:.2f}</b>\n"
+            f"📊 Profit Factor:   <b>{pf:.2f}</b>\n"
+            f"\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⭐️ <b>РЕКОРДЫ</b>\n"
+            f"🥇 Лучший:  {best}\n"
+            f"💀 Худший:  {worst}\n"
+            f"\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{verdict}"
         )
 
         tg_reply(chat_id, msg)
@@ -659,6 +774,24 @@ def handle_backtest(chat_id: int, args: list[str]):
     except Exception as e:
         logger.error(f"handle_backtest: {e}", exc_info=True)
         tg_reply(chat_id, f"❌ Ошибка: {e}")
+
+
+def handle_paper(chat_id: int, args: list[str]):
+    """
+    /paper — показывает статистику paper trading
+    /paper reset — сбросить счёт
+    """
+    if args and args[0].lower() == "reset":
+        reset_paper_account()
+        tg_reply(chat_id,
+            "🔄 <b>Paper Trading сброшен</b>\n"
+            f"Новый баланс: ${200:.2f}\n"
+            "Все сделки удалены."
+        )
+        return
+
+    report = get_paper_report()
+    tg_reply(chat_id, report)
 
 
 def handle_status(chat_id: int):
@@ -681,9 +814,8 @@ def handle_status(chat_id: int):
         f"🤖 <b>Bot Status</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⚙️ Scan interval:  {SCAN_INTERVAL}s\n"
-        f"🔎 Max symbols:    {'ALL' if MAX_SYMBOLS <= 0 else MAX_SYMBOLS}\n"
         f"📈 Min pump:       {Config.MIN_PUMP_PCT}%\n"
-        f"⭐ Min core score: {Config.MIN_SCORE}/5\n"
+        f"⭐ Min score:      {Config.MIN_SCORE}/7\n"
         f"📊 RSI threshold:  {Config.RSI_OVERBOUGHT}\n"
         f"💰 Min funding:    {Config.MIN_FUNDING_RATE*100:.3f}%\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -698,14 +830,9 @@ def handle_help(chat_id: int):
     tg_reply(chat_id,
         "🤖 <b>Pump Reversal Bot — Команды</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "/backtest — общий бэктест по всем сделкам за 180 дней\n"
-        "  Пример: <code>/backtest</code>\n"
-        "  С датами: <code>/backtest 2025-01-01 2025-12-31</code>\n\n"
-        "/backtest <code>ALL</code> — то же самое явно\n"
-        "  Пример: <code>/backtest ALL</code>\n\n"
-        "/backtest <code>SYMBOL</code> — бэктест одной монеты за 180 дней\n"
-        "  Пример: <code>/backtest PEPEUSDT</code>\n"
-        "  С датами: <code>/backtest BTCUSDT 2025-01-01 2025-12-31</code>\n\n"
+        "/backtest — бэктест по всем сигналам\n\n"
+        "/paper — paper trading статистика\n"
+        "/paper reset — сбросить paper счёт\n\n"
         "/status — настройки и статистика бота\n\n"
         "/help — эта справка\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -740,6 +867,12 @@ def process_update(update: dict):
             ).start()
         elif command == "/status":
             handle_status(chat_id)
+        elif command == "/paper":
+            threading.Thread(
+                target=handle_paper,
+                args=(chat_id, args),
+                daemon=True
+            ).start()
         elif command == "/help" or command == "/start":
             handle_help(chat_id)
         else:
@@ -781,7 +914,7 @@ def main():
         logger.error("TG_CHAT not set")
         return
 
-    logger.info(f"Starting — interval={SCAN_INTERVAL}s, pump={Config.MIN_PUMP_PCT}%, core_score={Config.MIN_SCORE}/5")
+    logger.info(f"Starting — interval={SCAN_INTERVAL}s, pump={Config.MIN_PUMP_PCT}%, score={Config.MIN_SCORE}/7")
 
     # Restore cooldown state from previous session
     _load_cooldown()
@@ -793,13 +926,11 @@ def main():
     tg_send_message(
         f"🤖 <b>Pump Reversal Bot — STARTED</b>\n"
         f"Scan interval: {SCAN_INTERVAL}s\n"
-        f"Max symbols: {'ALL' if MAX_SYMBOLS <= 0 else MAX_SYMBOLS}\n"
         f"Min pump: {Config.MIN_PUMP_PCT}%\n"
-        f"Min core score: {Config.MIN_SCORE}/5\n"
+        f"Min score: {Config.MIN_SCORE}/7\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Команды:\n"
-        f"/backtest — общий бэктест\n"
-        f"/backtest PEPEUSDT — бэктест монеты\n"
+        f"/backtest PEPEUSDT — бэктест\n"
         f"/status — статус бота\n"
         f"/help — справка\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"

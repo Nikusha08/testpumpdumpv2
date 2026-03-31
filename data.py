@@ -14,7 +14,7 @@ import logging
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from typing import Optional
+from typing import Optional, Iterable
 
 import pandas as pd
 
@@ -41,24 +41,6 @@ def _make_session() -> requests.Session:
     return session
 
 _session = _make_session()
-
-
-def _interval_to_timedelta(interval: str) -> pd.Timedelta:
-    unit = interval[-1].lower()
-    try:
-        value = int(interval[:-1])
-    except ValueError as e:
-        raise ValueError(f"Unsupported interval: {interval}") from e
-
-    if unit == "m":
-        return pd.Timedelta(minutes=value)
-    if unit == "h":
-        return pd.Timedelta(hours=value)
-    if unit == "d":
-        return pd.Timedelta(days=value)
-    if unit == "w":
-        return pd.Timedelta(weeks=value)
-    raise ValueError(f"Unsupported interval unit: {interval}")
 
 
 def _get(url: str, params: dict = None, timeout: int = 10) -> Optional[dict | list]:
@@ -103,56 +85,56 @@ def _get(url: str, params: dict = None, timeout: int = 10) -> Optional[dict | li
 # MARKET SCANNER — only real liquid perps
 # ─────────────────────────────────────────────
 
-def get_futures_market_snapshot(min_volume_usdt: float = 5_000_000) -> list[dict]:
+def get_24h_tickers(min_volume_usdt: float = 5_000_000) -> list[dict]:
     """
-    Returns liquid USDT perpetuals sorted by 24h quote volume descending.
-    Each item contains: symbol, quote_volume, last_price, price_change_percent.
+    Returns 24h ticker data for liquid USDT-margined perpetuals.
+    Filters:
+    - 24h quote volume >= min_volume_usdt
+    - Symbol ends with USDT
+    - Not a delivery/quarterly contract (no underscore in name)
+    - Price > 0 (active market)
     """
     data = _get(f"{BASE_URL}/fapi/v1/ticker/24hr")
     if not data:
-        logger.error("get_futures_market_snapshot: empty response")
+        logger.error("get_24h_tickers: empty response")
         return []
 
-    markets = []
+    filtered: list[dict] = []
     for t in data:
         sym = t.get("symbol", "")
         try:
             quote_vol = float(t.get("quoteVolume", 0))
-            price = float(t.get("lastPrice", 0))
-            change_pct = float(t.get("priceChangePercent", 0))
+            price     = float(t.get("lastPrice", 0))
+            change    = float(t.get("priceChangePercent", 0))
         except (ValueError, TypeError):
             continue
 
         if not sym.endswith("USDT"):
             continue
-        if "_" in sym:
+        if "_" in sym:           # quarterly/delivery: BTCUSDT_240329
             continue
         if price <= 0:
             continue
         if quote_vol < min_volume_usdt:
             continue
 
-        markets.append({
+        filtered.append({
             "symbol": sym,
-            "quote_volume": quote_vol,
-            "last_price": price,
-            "price_change_percent": change_pct,
+            "quoteVolume": quote_vol,
+            "lastPrice": price,
+            "priceChangePercent": change,
         })
 
-    markets.sort(key=lambda item: item["quote_volume"], reverse=True)
-    logger.info(f"get_futures_market_snapshot: {len(markets)} liquid perps found")
-    return markets
+    logger.info(f"get_24h_tickers: {len(filtered)} liquid perps found")
+    return filtered
 
 
 def get_futures_symbols(min_volume_usdt: float = 5_000_000) -> list[str]:
     """
-    Returns USDT-margined perpetual futures symbols filtered by:
-    - 24h quote volume >= min_volume_usdt
-    - Symbol ends with USDT
-    - Not a delivery/quarterly contract (no underscore in name)
-    - Price > 0 (active market)
+    Returns USDT-margined perpetual futures symbols filtered by liquidity.
     """
-    return [item["symbol"] for item in get_futures_market_snapshot(min_volume_usdt)]
+    tickers = get_24h_tickers(min_volume_usdt=min_volume_usdt)
+    return [t["symbol"] for t in tickers]
 
 
 def get_24h_change(symbol: str) -> Optional[float]:
@@ -167,6 +149,45 @@ def get_24h_change(symbol: str) -> Optional[float]:
         return None
 
 
+def get_latest_prices(symbols: Optional[Iterable[str]] = None) -> dict[str, float]:
+    """
+    Returns latest prices for symbols.
+    If symbols is None, returns all symbols.
+    """
+    data = _get(f"{BASE_URL}/fapi/v1/ticker/price")
+    if not data:
+        return {}
+
+    want = None
+    if symbols is not None:
+        want = {s for s in symbols}
+
+    prices: dict[str, float] = {}
+    try:
+        if isinstance(data, dict):
+            # Single symbol response
+            sym = data.get("symbol")
+            price = float(data.get("price", 0))
+            if sym and (want is None or sym in want) and price > 0:
+                prices[sym] = price
+            return prices
+
+        for item in data:
+            sym = item.get("symbol")
+            if want is not None and sym not in want:
+                continue
+            try:
+                price = float(item.get("price", 0))
+            except (TypeError, ValueError):
+                continue
+            if sym and price > 0:
+                prices[sym] = price
+        return prices
+    except Exception as e:
+        logger.warning(f"get_latest_prices: {e}")
+        return {}
+
+
 # ─────────────────────────────────────────────
 # KLINES (OHLCV)
 # ─────────────────────────────────────────────
@@ -178,20 +199,14 @@ _KLINE_COLS = [
 ]
 
 
-def get_klines(
-    symbol: str,
-    interval: str,
-    limit: int = 100,
-    closed_only: bool = True,
-) -> Optional[pd.DataFrame]:
+def get_klines(symbol: str, interval: str, limit: int = 100) -> Optional[pd.DataFrame]:
     """
     Fetch OHLCV from Binance Futures.
     Returns clean DataFrame or None if data is invalid.
     """
-    request_limit = min(limit + 1, 1500) if closed_only else limit
     data = _get(
         f"{BASE_URL}/fapi/v1/klines",
-        {"symbol": symbol, "interval": interval, "limit": request_limit}
+        {"symbol": symbol, "interval": interval, "limit": limit}
     )
     if not data or not isinstance(data, list) or len(data) < 5:
         logger.debug(f"get_klines({symbol},{interval}): empty/short response")
@@ -210,15 +225,6 @@ def get_klines(
         df = df.dropna()
         df = df[df["close"] > 0]
         df = df[df["high"] >= df["low"]]    # sanity: high >= low
-
-        if closed_only and not df.empty:
-            candle_size = _interval_to_timedelta(interval)
-            now_utc = pd.Timestamp.now(tz="UTC")
-            if df.index[-1] + candle_size > now_utc:
-                df = df.iloc[:-1]
-
-        if limit > 0 and len(df) > limit:
-            df = df.iloc[-limit:]
 
         if len(df) < 5:
             logger.debug(f"get_klines({symbol},{interval}): too few valid rows after clean")

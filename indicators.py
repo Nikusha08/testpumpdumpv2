@@ -33,16 +33,10 @@ def calc_rsi(closes: pd.Series, period: int = 14) -> float:
     avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
     avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
 
+    # Avoid division by zero
     avg_loss_safe = avg_loss.replace(0, np.nan)
-    rs = avg_gain / avg_loss_safe
+    rs  = avg_gain / avg_loss_safe
     rsi = 100 - (100 / (1 + rs))
-
-    flat = (avg_gain == 0) & (avg_loss == 0)
-    only_gains = (avg_gain > 0) & (avg_loss == 0)
-    only_losses = (avg_gain == 0) & (avg_loss > 0)
-    rsi = rsi.mask(flat, 50.0)
-    rsi = rsi.mask(only_gains, 100.0)
-    rsi = rsi.mask(only_losses, 0.0)
 
     val = float(rsi.iloc[-1])
     return val if math.isfinite(val) else float("nan")
@@ -162,7 +156,8 @@ def find_resistance_levels(
             validated.append((level, touches))
 
     if not validated:
-        return []
+        # Fallback: return pivot highs with min 1 touch
+        return sorted(set(round(c, 6) for c in candidates))
 
     # ── Merge nearby levels (within 1%) ────────────
     validated.sort(key=lambda x: x[0])
@@ -191,26 +186,20 @@ def find_resistance_levels(
     return sorted(set(merged))
 
 
-def nearest_resistance(
-    price: float,
-    levels: list[float],
-    max_distance_pct: float = 8.0,
-) -> Optional[float]:
+def nearest_resistance(price: float, levels: list[float]) -> Optional[float]:
     """
-    Returns the nearest resistance ABOVE current price.
-    Ignores levels that are too far away to be actionable.
+    Returns the nearest resistance ABOVE price (within 5%).
+    If nothing above, returns the closest level overall.
     """
     if not levels:
         return None
 
-    above = [
-        level for level in levels
-        if level >= price and level <= price * (1 + max_distance_pct / 100)
-    ]
-    if not above:
-        return None
+    above = [l for l in levels if l >= price * 0.97]
+    if above:
+        return min(above, key=lambda x: abs(x - price))
 
-    return min(above, key=lambda x: abs(x - price))
+    # Nothing above — return overall closest (rare edge case)
+    return min(levels, key=lambda x: abs(x - price))
 
 
 def price_near_resistance(

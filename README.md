@@ -5,25 +5,17 @@ Detects pump exhaustion and sends signals to Telegram.
 
 ## Strategy Logic
 
-Live signals and backtests now use the same closed-candle setup.
-
-Entry requires:
-- 24H pump >= `25%`
-- RSI (4H) >= `78`
-- price near confirmed `4H` or `1D` resistance
-- reversal trigger on the closed 4H candle: `volume spike` or `liquidity sweep`
-
-Confidence score:
+Signal requires **minimum 3 of 7 filters**:
 
 | # | Filter | Threshold |
 |---|--------|-----------|
 | 1 | 24H Pump | ≥ 25% |
-| 2 | RSI Overbought | ≥ 78 (4H) |
-| 3 | Near Resistance | ≤ 2% from confirmed level |
-| 4 | Volume Spike | ≥ 2.5× average |
-| 5 | Liquidity Sweep | Wick above recent highs and rejection |
-| 6 | High Funding Rate | ≥ 0.05% bonus |
-| 7 | OI Divergence | Price ↑ while OI ↓ bonus |
+| 2 | Volume Spike | ≥ 3× average |
+| 3 | RSI Overbought | ≥ 75 (4H) |
+| 4 | Near Resistance | ≤ 3% from level (4H or 1D) |
+| 5 | High Funding Rate | ≥ 0.05% |
+| 6 | OI Divergence | Price ↑ while OI ↓ |
+| 7 | Liquidity Sweep | Wick above recent highs |
 
 ## Project Structure
 
@@ -83,30 +75,16 @@ python bot.py
 ## Backtesting
 
 ```bash
-# Run backtest on BTCUSDT for full 2025
-python backtest.py --symbol BTCUSDT --start 2025-01-01 --end 2025-12-31
+# Run backtest on BTCUSDT for full 2024
+python backtest.py --symbol BTCUSDT --start 2024-01-01 --end 2024-12-31
 
 # Run on altcoin
-python backtest.py --symbol SOLUSDT --start 2025-06-01 --end 2025-12-31
-
-# Run portfolio backtest across all current liquid pairs
-python backtest.py --all --start 2025-01-01 --end 2025-12-31
-
-# Limit the portfolio universe to top 50 liquid pairs
-python backtest.py --all --max-symbols 50 --start 2025-01-01 --end 2025-12-31
+python backtest.py --symbol SOLUSDT --start 2024-06-01 --end 2024-12-31
 ```
-
-Backtest assumptions:
-- same closed-candle setup as live bot
-- no overlapping trades
-- entry/exit slippage
-- round-trip fees
-- TP1 partial take-profit with break-even runner
 
 Output:
 - Metrics printed to console
 - `backtest_BTCUSDT.csv` — all trades
-- `backtest_ALL.csv` — all trades for portfolio mode
 - `backtest_equity.png` — equity curve chart
 
 ## Signal Format (Telegram)
